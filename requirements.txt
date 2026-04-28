@@ -1,6 +1,5 @@
 fastapi
 uvicorn[standard]
-openai
 python-multipart
-aiofiles
+openai
 yt-dlp
