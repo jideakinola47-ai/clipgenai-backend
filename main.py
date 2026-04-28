@@ -1,267 +1,239 @@
-import os
-import uuid
-import json
-import asyncio
-import subprocess
+import os, uuid, json, subprocess, asyncio, tempfile, re, shutil
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 import openai
 
-app = FastAPI(title="ClipGen.AI Backend")
+app = FastAPI()
 
+# Allow EVERY origin - no restrictions
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-UPLOAD_DIR = Path("/tmp/clipgenai")
-UPLOAD_DIR.mkdir(exist_ok=True)
-jobs = {}
+# Override any host checking
+@app.middleware("http")
+async def allow_all_hosts(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
+JOBS = {}
+CLIPS_DIR = Path("/tmp/clips")
+CLIPS_DIR.mkdir(exist_ok=True)
+
+def get_ai_client():
+    return openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+
+def get_duration(path):
+    r = subprocess.run(
+        ["ffprobe","-v","error","-show_entries","format=duration",
+         "-of","default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True, timeout=30
+    )
+    try: return float(r.stdout.strip())
+    except: return 300.0
+
+def extract_audio_fast(video_path, audio_path):
+    """Extract mono 16kHz audio - smallest possible for Whisper"""
+    subprocess.run([
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-vn", "-ar", "16000", "-ac", "1",
+        "-b:a", "24k", "-f", "mp3",
+        str(audio_path)
+    ], capture_output=True, timeout=300)
+
+def cut_clip_fast(video_path, start, end, out_path):
+    """Cut clip fast with ultrafast preset"""
+    dur = max(float(end) - float(start), 5)
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-ss", str(float(start)),
+        "-i", str(video_path),
+        "-t", str(dur),
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30",
+        "-c:a", "aac", "-b:a", "64k",
+        "-movflags", "+faststart",
+        str(out_path)
+    ], capture_output=True, timeout=120)
+
+async def process_video(job_id: str, video_path: str, style: str, lang: str):
+    try:
+        JOBS[job_id] = {"status": "transcribing", "progress": 15, "clips": [], "error": None}
+
+        duration = await asyncio.get_event_loop().run_in_executor(None, get_duration, video_path)
+
+        # Extract tiny audio file
+        audio_path = video_path + "_audio.mp3"
+        await asyncio.get_event_loop().run_in_executor(None, extract_audio_fast, video_path, audio_path)
+
+        JOBS[job_id]["progress"] = 35
+
+        # Transcribe
+        ai = get_ai_client()
+        with open(audio_path, "rb") as f:
+            transcript = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: ai.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    response_format="verbose_json",
+                    timestamp_granularities=["segment"]
+                )
+            )
+
+        # Cleanup audio immediately
+        try: os.remove(audio_path)
+        except: pass
+
+        JOBS[job_id]["progress"] = 55
+        JOBS[job_id]["status"] = "scoring"
+
+        # Build segments text
+        segs = getattr(transcript, "segments", []) or []
+        seg_lines = "\n".join(f"[{s.start:.1f}-{s.end:.1f}] {s.text}" for s in segs[:60])
+        if not seg_lines:
+            seg_lines = (getattr(transcript, "text", "") or "")[:2000]
+
+        # GPT analysis
+        prompt = f"""Video duration: {duration:.0f}s. Style: {style}.
+Transcript:
+{seg_lines[:2500]}
+
+Find 5 best viral moments (30-75 seconds each). Return ONLY this JSON array, nothing else:
+[{{"start":10.5,"end":65.0,"title":"CATCHY TITLE CAPS","score":92}},{{"start":80.0,"end":140.0,"title":"SECOND TITLE","score":85}},{{"start":150.0,"end":210.0,"title":"THIRD TITLE","score":79}},{{"start":220.0,"end":280.0,"title":"FOURTH TITLE","score":73}},{{"start":290.0,"end":340.0,"title":"FIFTH TITLE","score":67}}]
+
+Rules: start/end within 0-{duration:.0f}, each clip 30-75s, score 0-100, titles ALL CAPS short."""
+
+        resp = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: ai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.5
+            )
+        )
+
+        JOBS[job_id]["progress"] = 70
+        JOBS[job_id]["status"] = "cutting"
+
+        # Parse moments
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r'```[a-z]*|```', '', raw).strip()
+        try:
+            moments = json.loads(raw)
+            if not isinstance(moments, list): raise ValueError()
+        except:
+            # Reliable fallback
+            step = duration / 6
+            moments = [
+                {"start": step*1, "end": step*1+60, "title": "KEY MOMENT", "score": 91},
+                {"start": step*2, "end": step*2+60, "title": "TOP INSIGHT", "score": 84},
+                {"start": step*3, "end": step*3+55, "title": "MUST WATCH", "score": 78},
+                {"start": step*4, "end": step*4+50, "title": "VIRAL CLIP", "score": 72},
+                {"start": step*4+60, "end": step*4+110, "title": "BEST PART", "score": 66},
+            ]
+
+        # Cut clips
+        job_dir = CLIPS_DIR / job_id
+        job_dir.mkdir(exist_ok=True)
+        clips = []
+
+        for i, m in enumerate(moments[:5]):
+            try:
+                s = max(0.0, float(m.get("start", 0)))
+                e = float(m.get("end", s + 60))
+                s = min(s, duration - 10)
+                e = min(e, duration)
+                if e - s < 5: e = min(s + 60, duration)
+
+                out = job_dir / f"clip_{i+1}.mp4"
+                await asyncio.get_event_loop().run_in_executor(None, cut_clip_fast, video_path, s, e, str(out))
+
+                if out.exists() and out.stat().st_size > 5000:
+                    clips.append({
+                        "id": f"clip_{i+1}",
+                        "title": str(m.get("title", f"CLIP {i+1}")),
+                        "score": int(m.get("score", 75)),
+                        "duration": round(e - s, 1),
+                        "download_url": f"/download/{job_id}/clip_{i+1}.mp4",
+                        "stream_url": f"/stream/{job_id}/clip_{i+1}.mp4",
+                    })
+            except Exception as clip_err:
+                print(f"Clip {i+1} failed: {clip_err}")
+
+            JOBS[job_id]["progress"] = 70 + (i + 1) * 6
+
+        if not clips:
+            raise Exception("Could not generate clips. Please try a different video file.")
+
+        JOBS[job_id].update({"status": "done", "progress": 100, "clips": clips})
+
+    except Exception as e:
+        JOBS[job_id] = {"status": "failed", "progress": 0, "clips": [], "error": str(e)}
+    finally:
+        try: os.remove(video_path)
+        except: pass
+
 
 @app.get("/")
-def root():
-    return {"status": "ClipGen.AI backend running", "version": "3.0"}
-
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ClipGen.AI backend running", "version": "3.0", "ok": True}
 
-@app.post("/upload-chunk")
-async def upload_chunk(
-    file: UploadFile = File(...),
-    job_id: str = Form(...),
-    chunk_index: int = Form(...),
-    total_chunks: int = Form(...),
-):
-    """Receive a single chunk of a large video"""
-    chunk_dir = UPLOAD_DIR / f"chunks_{job_id}"
-    chunk_dir.mkdir(exist_ok=True)
-    
-    chunk_path = chunk_dir / f"chunk_{chunk_index:04d}"
-    content = await file.read()
-    with open(chunk_path, "wb") as f:
-        f.write(content)
-    
-    return {"received": chunk_index, "total": total_chunks}
-
-@app.post("/assemble")
-async def assemble_video(
-    job_id: str = Form(...),
-    filename: str = Form(...),
-    total_chunks: int = Form(...),
-    style: str = Form("motivational"),
-    subtitle_language: str = Form("English"),
-    background_tasks: BackgroundTasks = None,
-):
-    """Assemble chunks and start processing"""
-    chunk_dir = UPLOAD_DIR / f"chunks_{job_id}"
-    video_path = UPLOAD_DIR / f"{job_id}_{filename}"
-    
-    # Assemble all chunks
-    with open(video_path, "wb") as outfile:
-        for i in range(total_chunks):
-            chunk_path = chunk_dir / f"chunk_{i:04d}"
-            if not chunk_path.exists():
-                raise HTTPException(status_code=400, detail=f"Missing chunk {i}")
-            with open(chunk_path, "rb") as infile:
-                outfile.write(infile.read())
-    
-    # Cleanup chunks
-    import shutil
-    shutil.rmtree(chunk_dir, ignore_errors=True)
-    
-    jobs[job_id] = {"status": "transcribing", "step": 1, "clips": [], "error": None}
-    background_tasks.add_task(process_video, job_id, video_path, style)
-    
-    return {"job_id": job_id, "status": "processing"}
+@app.options("/{rest:path}")
+async def preflight(rest: str):
+    return JSONResponse({}, headers={
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+        "Access-Control-Allow-Headers": "*",
+    })
 
 @app.post("/upload")
-async def upload_video(
+async def upload(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    style: str = Form("motivational"),
-    subtitle_language: str = Form("English"),
-    background_tasks: BackgroundTasks = None,
+    style: str = Form("General"),
+    subtitle_language: str = Form("English")
 ):
-    """Direct upload for smaller files"""
-    content = await file.read()
-    
-    job_id = str(uuid.uuid4())[:8]
-    jobs[job_id] = {"status": "uploading", "step": 0, "clips": [], "error": None}
+    job_id = str(uuid.uuid4())
+    suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
+    tmp = tempfile.mktemp(suffix=suffix, dir="/tmp")
 
-    video_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
-    with open(video_path, "wb") as f:
+    with open(tmp, "wb") as f:
+        content = await file.read()
         f.write(content)
 
-    jobs[job_id]["status"] = "transcribing"
-    jobs[job_id]["step"] = 1
-    background_tasks.add_task(process_video, job_id, video_path, style)
-    return {"job_id": job_id, "status": "processing"}
-
-@app.post("/import-url")
-async def import_url(
-    url: str = Form(...),
-    style: str = Form("motivational"),
-    subtitle_language: str = Form("English"),
-    background_tasks: BackgroundTasks = None,
-):
-    job_id = str(uuid.uuid4())[:8]
-    jobs[job_id] = {"status": "downloading", "step": 0, "clips": [], "error": None}
-    video_path = UPLOAD_DIR / f"{job_id}_video.mp4"
-    
-    cmd = ["yt-dlp", "-f", "best[filesize<100M]/best", "-o", str(video_path), "--max-filesize", "100M", url]
-    result = subprocess.run(cmd, capture_output=True, timeout=180)
-    
-    if result.returncode != 0:
-        raise HTTPException(status_code=400, detail="Could not download video. Please check the URL.")
-    
-    jobs[job_id]["status"] = "transcribing"
-    jobs[job_id]["step"] = 1
-    background_tasks.add_task(process_video, job_id, video_path, style)
-    return {"job_id": job_id, "status": "processing"}
+    JOBS[job_id] = {"status": "uploading", "progress": 5, "clips": [], "error": None}
+    background_tasks.add_task(process_video, job_id, tmp, style, subtitle_language)
+    return {"job_id": job_id, "status": "started"}
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+    if job_id not in JOBS:
+        raise HTTPException(404, "Job not found")
+    return JOBS[job_id]
 
 @app.get("/download/{job_id}/{filename}")
 def download_clip(job_id: str, filename: str):
-    file_path = UPLOAD_DIR / job_id / filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(file_path, media_type="video/mp4", filename=filename)
+    path = CLIPS_DIR / job_id / filename
+    if not path.exists():
+        raise HTTPException(404, "Clip not found")
+    return FileResponse(str(path), media_type="video/mp4",
+                        headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 @app.get("/stream/{job_id}/{filename}")
 def stream_clip(job_id: str, filename: str):
-    file_path = UPLOAD_DIR / job_id / filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    def iterfile():
-        with open(file_path, "rb") as f:
-            while chunk := f.read(1024 * 1024):
-                yield chunk
-    return StreamingResponse(iterfile(), media_type="video/mp4",
-        headers={"Accept-Ranges": "bytes", "Content-Disposition": "inline"})
-
-def get_video_duration(video_path):
-    try:
-        result = subprocess.run(["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(video_path)],
-            capture_output=True, text=True, timeout=30)
-        data = json.loads(result.stdout)
-        return float(data["format"]["duration"])
-    except:
-        return 60.0
-
-async def process_video(job_id: str, video_path: Path, style: str):
-    try:
-        client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        jobs[job_id] = {**jobs[job_id], "status": "transcribing", "step": 1}
-
-        with open(video_path, "rb") as f:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1", file=f,
-                response_format="verbose_json",
-                timestamp_granularities=["segment"]
-            )
-
-        duration_total = get_video_duration(video_path)
-        jobs[job_id] = {**jobs[job_id], "status": "scoring", "step": 2}
-
-        segments = getattr(transcript, 'segments', [])
-        if segments:
-            segments_text = "\n".join([
-                f"[{s['start']:.1f}s - {s['end']:.1f}s]: {s['text']}" if isinstance(s, dict)
-                else f"[{s.start:.1f}s - {s.end:.1f}s]: {s.text}"
-                for s in segments[:50]
-            ])
-        else:
-            segments_text = f"Video duration: {duration_total:.0f} seconds."
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": f"""Analyze this video and create 5 viral short clips.
-Style: {style}
-Duration: {duration_total:.0f}s
-Transcript: {segments_text}
-Return ONLY valid JSON array:
-[{{"start":5.0,"end":35.0,"hook_title":"TITLE","hook_subtitle":"SUBTITLE","viral_score":90,"viral_level":"Very High"}}]
-Rules: clips 15-45s, ALL CAPS max 4 words, spread throughout video, end<={duration_total:.0f}"""}],
-            temperature=0.3, max_tokens=600
-        )
-
-        raw = response.choices[0].message.content.strip()
-        if "```" in raw:
-            raw = raw.split("```")[1].split("```")[0].strip()
-            if raw.startswith("json"): raw = raw[4:]
-        s = raw.find('['); e = raw.rfind(']') + 1
-        if s >= 0 and e > s: raw = raw[s:e]
-
-        try:
-            clips_data = json.loads(raw.strip())
-        except:
-            seg = duration_total / 5
-            clips_data = [{"start": i*seg+2, "end": min(i*seg+32, duration_total-1),
-                "hook_title": t, "hook_subtitle": sub, "viral_score": sc, "viral_level": l}
-                for i, (t, sub, sc, l) in enumerate([
-                    ("KEY INSIGHT","WATCH NOW",92,"Very High"),
-                    ("POWERFUL MOMENT","SHARE THIS",87,"High"),
-                    ("VIRAL HOOK","MUST SEE",82,"High"),
-                    ("BEST PART","EPIC CLIP",77,"Medium"),
-                    ("TOP HIGHLIGHT","DON'T MISS",72,"Medium")])]
-
-        jobs[job_id] = {**jobs[job_id], "status": "cutting", "step": 3}
-        output_dir = UPLOAD_DIR / job_id
-        output_dir.mkdir(exist_ok=True)
-        clips = []
-
-        for i, clip in enumerate(clips_data[:5]):
-            try:
-                output_file = output_dir / f"clip_{i+1}.mp4"
-                start = max(0, float(clip.get("start", 0)))
-                end = float(clip.get("end", start + 30))
-                duration = min(max(end - start, 10), 60)
-                if start + duration > duration_total:
-                    start = max(0, duration_total - duration - 1)
-
-                cmd = ["ffmpeg", "-y", "-ss", str(start), "-i", str(video_path),
-                    "-t", str(duration),
-                    "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black",
-                    "-c:v", "libx264", "-c:a", "aac", "-preset", "ultrafast", "-crf", "28",
-                    str(output_file)]
-
-                result = subprocess.run(cmd, capture_output=True, timeout=180)
-                if result.returncode == 0 and output_file.exists():
-                    score = int(clip.get("viral_score", 80))
-                    color = "#34d399" if score >= 90 else "#a78bfa" if score >= 80 else "#fbbf24" if score >= 70 else "#fb923c"
-                    clips.append({
-                        "id": i+1, "filename": f"clip_{i+1}.mp4",
-                        "download_url": f"/download/{job_id}/clip_{i+1}.mp4",
-                        "stream_url": f"/stream/{job_id}/clip_{i+1}.mp4",
-                        "hook_title": str(clip.get("hook_title", f"CLIP {i+1}")),
-                        "hook_subtitle": str(clip.get("hook_subtitle", "WATCH NOW")),
-                        "viral_score": score,
-                        "viral_level": str(clip.get("viral_level", "High")),
-                        "duration": f"{int(duration//60)}:{int(duration%60):02d}",
-                        "color": color
-                    })
-            except Exception as e:
-                print(f"Clip {i+1} error: {e}")
-                continue
-
-        if clips:
-            jobs[job_id] = {"status": "done", "step": 5, "clips": clips, "error": None}
-        else:
-            jobs[job_id] = {"status": "failed", "step": 0, "clips": [],
-                "error": "Could not generate clips. Please try again."}
-
-        try: video_path.unlink(missing_ok=True)
-        except: pass
-
-    except Exception as e:
-        jobs[job_id] = {**jobs[job_id], "status": "failed", "error": str(e), "clips": []}
+    path = CLIPS_DIR / job_id / filename
+    if not path.exists():
+        raise HTTPException(404, "Clip not found")
+    return FileResponse(str(path), media_type="video/mp4")
