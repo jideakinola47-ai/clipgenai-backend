@@ -85,8 +85,9 @@ async def process_with_vizard(job_id: str, video_url: str, ext: str, lang: str):
             res = await client.post(VIZARD_CREATE, headers=headers, json=payload)
             data = res.json()
 
+        print(f"Vizard create response: {data}")
         if data.get("code") != 2000:
-            jobs[job_id] = {"status": "failed", "error": f"Vizard error: {data.get('message', 'Unknown error')}"}
+            jobs[job_id] = {"status": "failed", "error": f"Vizard error code {data.get('code')}: {data.get('message', str(data))}"}
             return
 
         project_id = data["projectId"]
@@ -123,7 +124,8 @@ async def process_with_vizard(job_id: str, video_url: str, ext: str, lang: str):
                 continue
 
             else:
-                jobs[job_id] = {"status": "failed", "error": f"Processing error: {result.get('message', 'Unknown')}"}
+                print(f"Vizard poll error: code={code}, response={result}")
+                jobs[job_id] = {"status": "failed", "error": f"Vizard code {code}: {result.get('message', str(result)[:200])}"}
                 return
 
         jobs[job_id] = {"status": "failed", "error": "Timed out waiting for Vizard"}
@@ -137,3 +139,18 @@ def status(job_id: str):
     if not job:
         raise HTTPException(404, "Job not found")
     return job
+
+@app.get("/test-vizard")
+async def test_vizard():
+    """Test Vizard API connectivity from Railway"""
+    import httpx
+    headers = {"VIZARDAI_API_KEY": VIZARD_API_KEY}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            res = await client.get(
+                "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/query/1",
+                headers=headers
+            )
+        return {"status_code": res.status_code, "response": res.text[:300]}
+    except Exception as e:
+        return {"error": str(e)}
