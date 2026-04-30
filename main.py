@@ -14,7 +14,7 @@ VIZARD_CREATE_URL = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/
 VIZARD_QUERY_URL = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/query/{project_id}"
 
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-VIZARD_API_KEY = os.getenv("VIZARD_API_KEY", "")
+VIZARD_API_KEY = os.getenv("76f3b8d194804562a7fb22584dbd2361", "")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
