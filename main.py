@@ -1,135 +1,269 @@
-import os, uuid, asyncio, httpx, shutil
+import os
+import re
+import uuid
 from pathlib import Path
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from typing import Any
+
+import requests
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-VIZARD_API_KEY = os.getenv("VIZARD_API_KEY", "d3d058e542074fa89cd861a18c6555d5")
-VIZARD_CREATE  = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/create"
-VIZARD_QUERY   = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/query/{}"
-BASE_URL       = os.getenv("BASE_URL", "https://web-production-189e9.up.railway.app")
+VIZARD_CREATE_URL = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/create"
+VIZARD_QUERY_URL = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/query/{project_id}"
 
+BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
+VIZARD_API_KEY = os.getenv("VIZARD_API_KEY", "")
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
-app.mount("/files", StaticFiles(directory="uploads"), name="files")
 
-jobs = {}
+app = FastAPI(title="ClipGen.AI Vizard Backend", version="1.0.0")
 
-LANG_MAP = {
-    "English": "en", "Lithuanian (Lietuvių)": "lt", "German (Deutsch)": "de",
-    "French (Français)": "fr", "Spanish (Español)": "es", "Polish (Polski)": "pl",
-    "Russian (Русский)": "ru", "Italian (Italiano)": "it", "Portuguese (Português)": "pt",
-    "Dutch (Nederlands)": "nl", "Swedish (Svenska)": "sv", "Norwegian (Norsk)": "no",
-    "Danish (Dansk)": "da", "Finnish (Suomi)": "fi", "Japanese (日本語)": "ja",
-    "Chinese (简体中文)": "zh", "Korean (한국어)": "ko", "Arabic (العربية)": "ar",
-    "Turkish (Türkçe)": "tr", "Hindi (हिन्दी)": "hi",
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+STATUS_MESSAGES = {
+    1000: "Vizard is still processing the video.",
+    2000: "Clips generated successfully.",
+    4001: "Invalid Vizard API key.",
+    4002: "Vizard clipping failed.",
+    4003: "Vizard rate limit exceeded.",
+    4004: "Unsupported video format.",
+    4005: "Invalid video URL or video length issue.",
+    4006: "Illegal Vizard API parameter.",
+    4007: "Insufficient Vizard account time or credits.",
+    4008: "Vizard failed to download the uploaded video.",
 }
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "engine": "vizard"}
 
-@app.get("/test-vizard")
-async def test_vizard():
-    async with httpx.AsyncClient(timeout=15) as client:
-        res = await client.get(VIZARD_QUERY.format(1), headers={"VIZARDAI_API_KEY": VIZARD_API_KEY})
-    return {"status_code": res.status_code, "response": res.text[:200]}
+def clean_filename(name: str) -> str:
+    stem = Path(name).stem or "video"
+    suffix = Path(name).suffix.lower() or ".mp4"
+    safe_stem = re.sub(r"[^a-zA-Z0-9._-]+", "-", stem).strip("-")[:80] or "video"
+    return f"{uuid.uuid4().hex}_{safe_stem}{suffix}"
 
-@app.post("/upload")
-async def upload(file: UploadFile = File(...), subtitle_language: str = Form("English"), style: str = Form("")):
-    job_id = str(uuid.uuid4())
-    jobs[job_id] = {"status": "uploading", "progress": 10}
 
-    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "mp4"
-    fname = f"{job_id}.{ext}"
-    with open(UPLOAD_DIR / fname, "wb") as f:
-        shutil.copyfileobj(file.file, f)
+def ext_from_filename(name: str) -> str:
+    ext = Path(name).suffix.lower().lstrip(".")
+    if ext not in {"mp4", "mov", "avi", "3gp"}:
+        raise HTTPException(status_code=400, detail="Unsupported video format. Use mp4, mov, avi, or 3gp.")
+    return ext
 
-    print(f"Saved {fname}")
-    asyncio.create_task(process_with_vizard(
-        job_id,
-        f"{BASE_URL}/files/{fname}",
-        ext,
-        LANG_MAP.get(subtitle_language, "en")
-    ))
-    return {"job_id": job_id}
 
-async def process_with_vizard(job_id: str, video_url: str, ext: str, lang: str):
+def vizard_headers() -> dict[str, str]:
+    if not VIZARD_API_KEY:
+        raise HTTPException(status_code=500, detail="VIZARD_API_KEY is missing on the server.")
+    return {
+        "Content-Type": "application/json",
+        "VIZARDAI_API_KEY": VIZARD_API_KEY,
+    }
+
+
+def score_to_percent(value: Any) -> int:
     try:
-        jobs[job_id] = {"status": "transcribing", "progress": 25}
-        headers = {"Content-Type": "application/json", "VIZARDAI_API_KEY": VIZARD_API_KEY}
-        payload = {
-            "videoUrl": video_url, "videoType": 1, "ext": ext, "lang": lang,
-            "preferLength": [1, 2], "ratioOfClip": 1,
-            "subtitleSwitch": 1, "headlineSwitch": 1, "maxClipNumber": 10,
+        score = float(value or 0)
+    except (TypeError, ValueError):
+        score = 0
+    if score <= 10:
+        score *= 10
+    return max(0, min(100, round(score)))
+
+
+def normalize_clip(item: dict[str, Any], index: int) -> dict[str, Any]:
+    duration_ms = item.get("videoMsDuration") or item.get("durationMs") or 0
+    try:
+        duration_seconds = round(float(duration_ms) / 1000)
+    except (TypeError, ValueError):
+        duration_seconds = 0
+
+    video_url = item.get("videoUrl") or item.get("url") or item.get("downloadUrl") or ""
+    title = item.get("title") or f"Clip {index + 1}"
+
+    return {
+        "id": str(item.get("videoId") or item.get("id") or index + 1),
+        "title": title,
+        "score": score_to_percent(item.get("viralScore")),
+        "viral_score": score_to_percent(item.get("viralScore")),
+        "duration": duration_seconds,
+        "duration_seconds": duration_seconds,
+        "url": video_url,
+        "video_url": video_url,
+        "download_url": video_url,
+        "thumbnail_url": item.get("thumbnailUrl") or item.get("coverUrl") or "",
+        "reason": item.get("viralReason") or "",
+        "viral_reason": item.get("viralReason") or "",
+        "transcript": item.get("transcript") or "",
+        "editor_url": item.get("clipEditorUrl") or "",
+        "raw": item,
+    }
+
+
+def normalize_vizard_response(data: dict[str, Any]) -> dict[str, Any]:
+    code = data.get("code")
+    videos = data.get("videos") or []
+
+    if code == 1000:
+        return {
+            "status": "processing",
+            "progress": 75,
+            "message": STATUS_MESSAGES[1000],
+            "raw": data,
         }
 
-        async with httpx.AsyncClient(timeout=120) as client:
-            res = await client.post(VIZARD_CREATE, headers=headers, json=payload)
+    if code == 2000 and videos:
+        clips = [normalize_clip(item, index) for index, item in enumerate(videos)]
+        return {
+            "status": "completed",
+            "progress": 100,
+            "clips": clips,
+            "results": clips,
+            "project_id": data.get("projectId"),
+            "project_name": data.get("projectName"),
+            "share_link": data.get("shareLink"),
+            "raw": data,
+        }
 
-        print(f"Create: {res.status_code} {res.text[:300]}")
-        if res.status_code != 200:
-            jobs[job_id] = {"status": "failed", "error": f"HTTP {res.status_code}: {res.text[:200]}"}
-            return
+    if code == 2000:
+        return {
+            "status": "processing",
+            "progress": 90,
+            "message": "Vizard finished the project but clips are not available yet. Poll again shortly.",
+            "raw": data,
+        }
 
-        data = res.json()
-        if data.get("code") != 2000:
-            jobs[job_id] = {"status": "failed", "error": f"Code {data.get('code')}: {data.get('errMsg', str(data)[:200])}"}
-            return
+    return {
+        "status": "failed",
+        "error": data.get("errMsg") or STATUS_MESSAGES.get(code, f"Unknown Vizard response code: {code}"),
+        "code": code,
+        "raw": data,
+    }
 
-        project_id = data["projectId"]
-        print(f"Project ID: {project_id}")
-        jobs[job_id] = {"status": "scoring", "progress": 40}
 
-        for attempt in range(150):
-            await asyncio.sleep(6)
-            try:
-                async with httpx.AsyncClient(timeout=30) as client:
-                    poll = await client.get(VIZARD_QUERY.format(project_id), headers={"VIZARDAI_API_KEY": VIZARD_API_KEY})
-                result = poll.json()
-                code = result.get("code")
-                print(f"Poll {attempt}: code={code}")
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"status": "ok", "engine": "vizard"}
 
-                if code == 2000:
-                    # EXACT field names from Vizard response
-                    clips = []
-                    for item in result.get("videos", []):
-                        clips.append({
-                            "id": str(item.get("videoId", len(clips))),
-                            "title": item.get("title", f"Clip {len(clips)+1}"),
-                            "score": float(item.get("viralScore", 8.0)) * 10,  # convert 9.8 → 98
-                            "duration": int(item.get("videoMsDuration", 45000)) // 1000,  # ms → seconds
-                            "download_url": item.get("videoUrl", ""),
-                            "stream_url": item.get("videoUrl", ""),
-                            "thumbnail": item.get("coverUrl", ""),
-                            "viral_reason": item.get("viralReason", ""),
-                        })
-                    print(f"Done! {len(clips)} clips")
-                    jobs[job_id] = {"status": "done", "progress": 100, "clips": clips}
-                    return
 
-                elif code == 2001:
-                    jobs[job_id] = {"status": "cutting", "progress": min(40 + attempt, 92)}
-                else:
-                    jobs[job_id] = {"status": "failed", "error": f"Code {code}: {result.get('errMsg', str(result)[:200])}"}
-                    return
-            except Exception as e:
-                print(f"Poll error: {e}")
-                continue
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok", "engine": "vizard"}
 
-        jobs[job_id] = {"status": "failed", "error": "Timed out"}
 
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc())
-        jobs[job_id] = {"status": "failed", "error": str(e)}
+@app.get("/files/{filename}")
+def get_file(filename: str) -> FileResponse:
+    path = (UPLOAD_DIR / filename).resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    if upload_root not in path.parents or not path.exists():
+        raise HTTPException(status_code=404, detail="File not found.")
+    return FileResponse(path)
 
-@app.get("/status/{job_id}")
-def status(job_id: str):
-    job = jobs.get(job_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-    return job
+
+@app.post("/upload")
+async def upload_video(
+    file: UploadFile = File(...),
+    language: str = Form("auto"),
+    prefer_length: int = Form(2),
+    max_clips: int = Form(8),
+    subtitle_switch: int = Form(1),
+    headline_switch: int = Form(1),
+    ratio: int = Form(1),
+) -> dict[str, Any]:
+    if not BASE_URL:
+        raise HTTPException(status_code=500, detail="BASE_URL is missing on the server.")
+
+    ext = ext_from_filename(file.filename or "video.mp4")
+    filename = clean_filename(file.filename or "video.mp4")
+    path = UPLOAD_DIR / filename
+
+    with path.open("wb") as out:
+        while chunk := await file.read(1024 * 1024):
+            out.write(chunk)
+
+    video_url = f"{BASE_URL}/files/{filename}"
+    payload = {
+        "lang": language or "auto",
+        "preferLength": [prefer_length] if prefer_length in {1, 2, 3, 4} else [0],
+        "videoUrl": video_url,
+        "videoType": 1,
+        "ext": ext,
+        "ratioOfClip": ratio,
+        "subtitleSwitch": 1 if subtitle_switch else 0,
+        "headlineSwitch": 1 if headline_switch else 0,
+        "maxClipNumber": max(1, min(int(max_clips or 8), 20)),
+        "projectName": Path(file.filename or filename).stem[:80],
+    }
+
+    try:
+        response = requests.post(
+            VIZARD_CREATE_URL,
+            headers=vizard_headers(),
+            json=payload,
+            timeout=45,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Vizard create request failed: {exc}") from exc
+
+    if data.get("code") != 2000 or not data.get("projectId"):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": data.get("errMsg") or STATUS_MESSAGES.get(data.get("code"), "Vizard did not create a project."),
+                "vizard_response": data,
+            },
+        )
+
+    project_id = str(data["projectId"])
+    return {
+        "status": "processing",
+        "job_id": project_id,
+        "id": project_id,
+        "project_id": project_id,
+        "message": "Video accepted by Vizard. Poll /status/{project_id} for clips.",
+        "video_url": video_url,
+        "vizard_response": data,
+    }
+
+
+@app.get("/status/{project_id}")
+def get_status(project_id: str) -> dict[str, Any]:
+    try:
+        response = requests.get(
+            VIZARD_QUERY_URL.format(project_id=project_id),
+            headers=vizard_headers(),
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=f"Vizard query request failed: {exc}") from exc
+
+    normalized = normalize_vizard_response(data)
+    normalized["job_id"] = str(project_id)
+    return normalized
+
+
+@app.get("/debug-project/{project_id}")
+def debug_project(project_id: str) -> dict[str, Any]:
+    try:
+        response = requests.get(
+            VIZARD_QUERY_URL.format(project_id=project_id),
+            headers=vizard_headers(),
+            timeout=30,
+        )
+        raw = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Debug query failed: {exc}") from exc
+    return {
+        "http_status": response.status_code,
+        "normalized": normalize_vizard_response(raw),
+        "raw": raw,
+    }
