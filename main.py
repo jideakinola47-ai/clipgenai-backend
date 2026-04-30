@@ -175,3 +175,13 @@ def status(job_id: str):
     if not job:
         raise HTTPException(404, "Job not found")
     return job
+
+@app.get("/debug-project/{project_id}")
+async def debug_project(project_id: str):
+    """Debug - query a specific Vizard project"""
+    async with httpx.AsyncClient(timeout=30) as client:
+        res = await client.get(
+            VIZARD_QUERY.format(project_id),
+            headers={"VIZARDAI_API_KEY": VIZARD_API_KEY}
+        )
+    return {"status_code": res.status_code, "raw": res.json()}
