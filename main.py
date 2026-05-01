@@ -1,163 +1,135 @@
-
-from typing import Any
-
-import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+import os, uuid, asyncio, httpx, shutil
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
-    return ext
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
+VIZARD_API_KEY = os.getenv("VIZARD_API_KEY", "76f3b8d194804562a7fb22584dbd2361")
+VIZARD_CREATE  = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/create"
+VIZARD_QUERY   = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/query/{}"
+BASE_URL       = os.getenv("BASE_URL", "https://web-production-189e9.up.railway.app")
 
-LANGUAGE_CODES = {
-    "auto": "auto",
-    "english": "en",
-    "en": "en",
-    "spanish": "es",
-    "es": "es",
-    "french": "fr",
-    "fr": "fr",
-    "german": "de",
-    "de": "de",
-    "portuguese": "pt",
-    "pt": "pt",
-    "russian": "ru",
-    "ru": "ru",
-    "italian": "it",
-    "it": "it",
-    "dutch": "nl",
-    "nl": "nl",
-    "arabic": "ar",
-    "ar": "ar",
-    "hindi": "hi",
-    "hi": "hi",
-    "indonesian": "id",
-    "id": "id",
-    "japanese": "ja",
-    "ja": "ja",
-    "korean": "ko",
-    "ko": "ko",
-    "mandarin": "zh",
-    "chinese": "zh",
-    "zh": "zh",
-    "turkish": "tr",
-    "tr": "tr",
-    "ukrainian": "uk",
-    "uk": "uk",
-    "vietnamese": "vi",
-    "vi": "vi",
-    # Vizard may auto-detect languages not listed in its API docs.
-    "lithuanian": "auto",
-    "lt": "auto",
-    "polish": "auto",
-    "pl": "auto",
-    "swedish": "auto",
-    "norwegian": "auto",
-    "danish": "auto",
-    "finnish": "auto",
+UPLOAD_DIR = Path("uploads")
+UPLOAD_DIR.mkdir(exist_ok=True)
+app.mount("/files", StaticFiles(directory="uploads"), name="files")
+
+jobs = {}
+
+LANG_MAP = {
+    "English": "en", "Lithuanian (Lietuvių)": "lt", "German (Deutsch)": "de",
+    "French (Français)": "fr", "Spanish (Español)": "es", "Polish (Polski)": "pl",
+    "Russian (Русский)": "ru", "Italian (Italiano)": "it", "Portuguese (Português)": "pt",
+    "Dutch (Nederlands)": "nl", "Swedish (Svenska)": "sv", "Norwegian (Norsk)": "no",
+    "Danish (Dansk)": "da", "Finnish (Suomi)": "fi", "Japanese (日本語)": "ja",
+    "Chinese (简体中文)": "zh", "Korean (한국어)": "ko", "Arabic (العربية)": "ar",
+    "Turkish (Türkçe)": "tr", "Hindi (हिन्दी)": "hi",
 }
 
+@app.get("/health")
+def health():
+    return {"status": "ok", "engine": "vizard"}
 
-def normalize_language(value: Any) -> str:
-    key = str(value or "auto").strip().lower()
-    return LANGUAGE_CODES.get(key, "auto")
-
-
-def int_from_form(value: Any, default: int) -> int:
-    if value is None:
-        return default
-    text = str(value).strip().lower()
-    if not text:
-        return default
-    match = re.search(r"\d+", text)
-    if not match:
-        return default
-    try:
-        return int(match.group(0))
-    except ValueError:
-        return default
-
-
-def prefer_length_from_form(value: Any) -> int:
-    text = str(value or "").strip().lower()
-    if "30" in text and "60" in text:
-        return 2
-    if "60" in text and "90" in text:
-        return 3
-    if "90" in text or "3min" in text or "3 min" in text:
-        return 4
-    number = int_from_form(value, 2)
-    return number if number in {0, 1, 2, 3, 4} else 2
-
-
-def bool_int_from_form(value: Any, default: int = 1) -> int:
-    if value is None:
-        return default
-    text = str(value).strip().lower()
-    if text in {"0", "false", "off", "no", "disabled"}:
-        return 0
-    return 1
-
-
-def vizard_headers() -> dict[str, str]:
-    if not VIZARD_API_KEY:
-        raise HTTPException(status_code=500, detail="VIZARD_API_KEY is missing on the server.")
-
+@app.get("/test-vizard")
+async def test_vizard():
+    async with httpx.AsyncClient(timeout=15) as client:
+        res = await client.get(VIZARD_QUERY.format(1), headers={"VIZARDAI_API_KEY": VIZARD_API_KEY})
+    return {"status_code": res.status_code, "response": res.text[:200]}
 
 @app.post("/upload")
-async def upload_video(
-    file: UploadFile = File(...),
-    language: str = Form("auto"),
-    prefer_length: int = Form(2),
-    max_clips: int = Form(8),
-    subtitle_switch: int = Form(1),
-    headline_switch: int = Form(1),
-    ratio: int = Form(1),
-) -> dict[str, Any]:
-async def upload_video(request: Request) -> dict[str, Any]:
-    if not BASE_URL:
-        raise HTTPException(status_code=500, detail="BASE_URL is missing on the server.")
+async def upload(file: UploadFile = File(...), subtitle_language: str = Form("English"), style: str = Form("")):
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {"status": "uploading", "progress": 10}
 
-    form = await request.form()
-    file = None
-    for key in ("file", "video", "upload", "media"):
-        candidate = form.get(key)
-        if isinstance(candidate, UploadFile):
-            file = candidate
-            break
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "mp4"
+    fname = f"{job_id}.{ext}"
+    with open(UPLOAD_DIR / fname, "wb") as f:
+        shutil.copyfileobj(file.file, f)
 
-    if file is None:
-        raise HTTPException(
-            status_code=400,
-            detail="No video file found in upload. Expected form field named file or video.",
-        )
+    print(f"Saved {fname}")
+    asyncio.create_task(process_with_vizard(
+        job_id,
+        f"{BASE_URL}/files/{fname}",
+        ext,
+        LANG_MAP.get(subtitle_language, "en")
+    ))
+    return {"job_id": job_id}
 
-    language = normalize_language(
-        form.get("language")
-        or form.get("subtitleLanguage")
-        or form.get("subtitle_language")
-        or form.get("lang")
-        or "auto"
-    )
-    prefer_length = prefer_length_from_form(
-        form.get("prefer_length") or form.get("preferLength") or form.get("clipLength") or 2
-    )
-    max_clips = int_from_form(form.get("max_clips") or form.get("maxClipNumber"), 8)
-    subtitle_switch = bool_int_from_form(
-        form.get("subtitle_switch") or form.get("subtitleSwitch") or form.get("captions"), 1
-    )
-    headline_switch = bool_int_from_form(form.get("headline_switch") or form.get("headlineSwitch"), 1)
-    ratio = int_from_form(form.get("ratio") or form.get("ratioOfClip"), 1)
+async def process_with_vizard(job_id: str, video_url: str, ext: str, lang: str):
+    try:
+        jobs[job_id] = {"status": "transcribing", "progress": 25}
+        headers = {"Content-Type": "application/json", "VIZARDAI_API_KEY": VIZARD_API_KEY}
+        payload = {
+            "videoUrl": video_url, "videoType": 1, "ext": ext, "lang": lang,
+            "preferLength": [1, 2], "ratioOfClip": 1,
+            "subtitleSwitch": 1, "headlineSwitch": 1, "maxClipNumber": 10,
+        }
 
-    ext = ext_from_filename(file.filename or "video.mp4")
-    filename = clean_filename(file.filename or "video.mp4")
-    path = UPLOAD_DIR / filename
+        async with httpx.AsyncClient(timeout=120) as client:
+            res = await client.post(VIZARD_CREATE, headers=headers, json=payload)
 
-    video_url = f"{BASE_URL}/files/{filename}"
-    payload = {
-        "lang": language or "auto",
-        "lang": language,
-        "preferLength": [prefer_length] if prefer_length in {1, 2, 3, 4} else [0],
-        "videoUrl": video_url,
-        "videoType": 1,
+        print(f"Create: {res.status_code} {res.text[:300]}")
+        if res.status_code != 200:
+            jobs[job_id] = {"status": "failed", "error": f"HTTP {res.status_code}: {res.text[:200]}"}
+            return
+
+        data = res.json()
+        if data.get("code") != 2000:
+            jobs[job_id] = {"status": "failed", "error": f"Code {data.get('code')}: {data.get('errMsg', str(data)[:200])}"}
+            return
+
+        project_id = data["projectId"]
+        print(f"Project ID: {project_id}")
+        jobs[job_id] = {"status": "scoring", "progress": 40}
+
+        for attempt in range(150):
+            await asyncio.sleep(6)
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    poll = await client.get(VIZARD_QUERY.format(project_id), headers={"VIZARDAI_API_KEY": VIZARD_API_KEY})
+                result = poll.json()
+                code = result.get("code")
+                print(f"Poll {attempt}: code={code}")
+
+                if code == 2000:
+                    # EXACT field names from Vizard response
+                    clips = []
+                    for item in result.get("videos", []):
+                        clips.append({
+                            "id": str(item.get("videoId", len(clips))),
+                            "title": item.get("title", f"Clip {len(clips)+1}"),
+                            "score": float(item.get("viralScore", 8.0)) * 10,  # convert 9.8 → 98
+                            "duration": int(item.get("videoMsDuration", 45000)) // 1000,  # ms → seconds
+                            "download_url": item.get("videoUrl", ""),
+                            "stream_url": item.get("videoUrl", ""),
+                            "thumbnail": item.get("coverUrl", ""),
+                            "viral_reason": item.get("viralReason", ""),
+                        })
+                    print(f"Done! {len(clips)} clips")
+                    jobs[job_id] = {"status": "done", "progress": 100, "clips": clips}
+                    return
+
+                elif code == 2001:
+                    jobs[job_id] = {"status": "cutting", "progress": min(40 + attempt, 92)}
+                else:
+                    jobs[job_id] = {"status": "failed", "error": f"Code {code}: {result.get('errMsg', str(result)[:200])}"}
+                    return
+            except Exception as e:
+                print(f"Poll error: {e}")
+                continue
+
+        jobs[job_id] = {"status": "failed", "error": "Timed out"}
+
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        jobs[job_id] = {"status": "failed", "error": str(e)}
+
+@app.get("/status/{job_id}")
+def status(job_id: str):
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return job
