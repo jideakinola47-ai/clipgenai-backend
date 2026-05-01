@@ -5,13 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 VIZARD_API_KEY = os.getenv("VIZARD_API_KEY", "76f3b8d194804562a7fb22584dbd2361")
 VIZARD_CREATE  = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/create"
@@ -34,21 +28,54 @@ LANG_MAP = {
     "Turkish (Türkçe)": "tr", "Hindi (हिन्दी)": "hi",
 }
 
+def parse_clips(result):
+    clips = []
+    for item in result.get("videos", []):
+        url = item.get("videoUrl", "")
+        try:
+            score = round(float(item.get("viralScore", "8.0")) * 10)
+        except:
+            score = 80
+        try:
+            duration = int(item.get("videoMsDuration", 45000)) // 1000
+        except:
+            duration = 45
+        clips.append({
+            "id": str(item.get("videoId", len(clips))),
+            "title": item.get("title", f"Clip {len(clips)+1}"),
+            "score": score,
+            "duration": duration,
+            "download_url": url,
+            "stream_url": url,
+            "thumbnail": item.get("coverUrl", ""),
+            "viral_reason": item.get("viralReason", ""),
+        })
+    return clips
+
 @app.get("/health")
 def health():
     return {"status": "ok", "engine": "vizard"}
 
-@app.get("/test-vizard")
-async def test_vizard():
+@app.get("/project/{project_id}")
+async def get_project(project_id: str):
+    """Fetch clips directly from Vizard project ID"""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=30) as client:
             res = await client.get(
-                VIZARD_QUERY.format(1),
+                VIZARD_QUERY.format(project_id),
                 headers={"VIZARDAI_API_KEY": VIZARD_API_KEY}
             )
-        return {"status_code": res.status_code, "response": res.text[:300]}
+        result = res.json()
+        code = result.get("code")
+        if code == 2000:
+            clips = parse_clips(result)
+            return {"status": "done", "progress": 100, "clips": clips}
+        elif code == 2001:
+            return {"status": "cutting", "progress": 50, "clips": []}
+        else:
+            return {"status": "failed", "error": str(result), "clips": []}
     except Exception as e:
-        return {"error": str(e)}
+        return {"status": "failed", "error": str(e), "clips": []}
 
 @app.post("/upload")
 async def upload(
@@ -59,130 +86,79 @@ async def upload(
     job_id = str(uuid.uuid4())
     jobs[job_id] = {"status": "uploading", "progress": 10}
 
-    ext = "mp4"
-    if "." in file.filename:
-        ext = file.filename.rsplit(".", 1)[-1].lower()
-
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "mp4"
     fname = f"{job_id}.{ext}"
-    fpath = UPLOAD_DIR / fname
-
-    with open(fpath, "wb") as f:
+    with open(UPLOAD_DIR / fname, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    print(f"Saved: {fname} size={fpath.stat().st_size}")
-
+    print(f"Saved: {fname}")
     video_url = f"{BASE_URL}/files/{fname}"
     lang = LANG_MAP.get(subtitle_language, "en")
-
     asyncio.create_task(process_vizard(job_id, video_url, ext, lang))
     return {"job_id": job_id}
 
 async def process_vizard(job_id: str, video_url: str, ext: str, lang: str):
     try:
         jobs[job_id] = {"status": "transcribing", "progress": 25}
-
-        headers = {
-            "Content-Type": "application/json",
-            "VIZARDAI_API_KEY": VIZARD_API_KEY
-        }
-
+        headers = {"Content-Type": "application/json", "VIZARDAI_API_KEY": VIZARD_API_KEY}
         payload = {
-            "videoUrl": video_url,
-            "videoType": 1,
-            "ext": ext,
-            "lang": lang,
-            "preferLength": [1, 2],
-            "ratioOfClip": 1,
-            "subtitleSwitch": 1,
-            "headlineSwitch": 1,
-            "maxClipNumber": 10,
+            "videoUrl": video_url, "videoType": 1, "ext": ext, "lang": lang,
+            "preferLength": [1, 2], "ratioOfClip": 1,
+            "subtitleSwitch": 1, "headlineSwitch": 1, "maxClipNumber": 10,
         }
-
-        print(f"Calling Vizard create: {video_url}")
 
         async with httpx.AsyncClient(timeout=120) as client:
             res = await client.post(VIZARD_CREATE, headers=headers, json=payload)
 
-        print(f"Vizard create response: {res.status_code} | {res.text[:400]}")
+        print(f"Create: {res.status_code} | {res.text[:300]}")
 
         if res.status_code != 200:
-            jobs[job_id] = {"status": "failed", "error": f"HTTP {res.status_code}: {res.text[:200]}"}
+            jobs[job_id] = {"status": "failed", "error": f"HTTP {res.status_code}"}
             return
 
         data = res.json()
-
         if data.get("code") != 2000:
-            err = data.get("errMsg") or data.get("message") or str(data)[:200]
-            jobs[job_id] = {"status": "failed", "error": f"Vizard error {data.get('code')}: {err}"}
+            jobs[job_id] = {"status": "failed", "error": f"Code {data.get('code')}: {data.get('errMsg', '')}"}
             return
 
         project_id = data.get("projectId")
-        print(f"Vizard project_id: {project_id}")
-        jobs[job_id] = {"status": "scoring", "progress": 40}
+        print(f"Project ID: {project_id}")
+        # Store project_id so frontend can use it as fallback
+        jobs[job_id] = {"status": "scoring", "progress": 40, "project_id": project_id}
 
-        # Poll for completion
-        for attempt in range(150):
+        # Poll up to 20 minutes (200 attempts x 6 seconds)
+        for attempt in range(200):
             await asyncio.sleep(6)
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
-                    poll_res = await client.get(
+                    poll = await client.get(
                         VIZARD_QUERY.format(project_id),
                         headers={"VIZARDAI_API_KEY": VIZARD_API_KEY}
                     )
-                result = poll_res.json()
+                result = poll.json()
                 code = result.get("code")
                 print(f"Poll {attempt}: code={code}")
 
                 if code == 2000:
-                    # Parse clips using exact field names from Vizard API
-                    clips = []
-                    for item in result.get("videos", []):
-                        url = item.get("videoUrl", "")
-                        score_raw = item.get("viralScore", "8.0")
-                        try:
-                            score = round(float(score_raw) * 10)
-                        except Exception:
-                            score = 80
-                        duration_ms = item.get("videoMsDuration", 45000)
-                        try:
-                            duration = int(duration_ms) // 1000
-                        except Exception:
-                            duration = 45
-                        clips.append({
-                            "id": str(item.get("videoId", len(clips))),
-                            "title": item.get("title", f"Clip {len(clips) + 1}"),
-                            "score": score,
-                            "duration": duration,
-                            "download_url": url,
-                            "stream_url": url,
-                            "thumbnail": item.get("coverUrl", ""),
-                            "viral_reason": item.get("viralReason", ""),
-                        })
-                    print(f"Done! {len(clips)} clips extracted")
+                    clips = parse_clips(result)
+                    print(f"Done! {len(clips)} clips")
                     jobs[job_id] = {"status": "done", "progress": 100, "clips": clips}
                     return
-
                 elif code == 2001:
-                    # Still processing
-                    progress = min(40 + attempt, 92)
-                    jobs[job_id] = {"status": "cutting", "progress": progress}
-
+                    progress = min(40 + attempt // 2, 92)
+                    jobs[job_id] = {"status": "cutting", "progress": progress, "project_id": project_id}
                 else:
-                    err = result.get("errMsg") or result.get("message") or str(result)[:200]
-                    print(f"Vizard poll error: code={code} err={err}")
-                    jobs[job_id] = {"status": "failed", "error": f"Vizard {code}: {err}"}
+                    jobs[job_id] = {"status": "failed", "error": f"Code {code}: {result.get('errMsg', '')}"}
                     return
-
-            except Exception as poll_err:
-                print(f"Poll attempt {attempt} error: {poll_err}")
+            except Exception as e:
+                print(f"Poll error: {e}")
                 continue
 
-        jobs[job_id] = {"status": "failed", "error": "Timed out waiting for Vizard"}
+        jobs[job_id] = {"status": "failed", "error": "Timed out", "project_id": project_id}
 
     except Exception as e:
         import traceback
-        tb = traceback.format_exc()
-        print(f"Exception: {tb}")
+        print(traceback.format_exc())
         jobs[job_id] = {"status": "failed", "error": str(e)}
 
 @app.get("/status/{job_id}")
