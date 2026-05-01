@@ -1,21 +1,20 @@
-import os, uuid, asyncio, httpx, shutil
+import os, uuid, asyncio, httpx, shutil, base64
 from pathlib import Path
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-VIZARD_API_KEY = os.getenv("VIZARD_API_KEY", "76f3b8d194804562a7fb22584dbd2361")
-VIZARD_CREATE  = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/create"
-VIZARD_QUERY   = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/query/{}"
-BASE_URL       = os.getenv("BASE_URL", "https://web-production-189e9.up.railway.app")
+VIZARD_API_KEY    = os.getenv("VIZARD_API_KEY", "76f3b8d194804562a7fb22584dbd2361")
+CLOUDINARY_CLOUD  = os.getenv("CLOUDINARY_CLOUD", "")
+CLOUDINARY_KEY    = os.getenv("CLOUDINARY_KEY", "")
+CLOUDINARY_SECRET = os.getenv("CLOUDINARY_SECRET", "")
+VIZARD_CREATE     = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/create"
+VIZARD_QUERY      = "https://elb-api.vizard.ai/hvizard-server-front/open-api/v1/project/query/{}"
 
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
-app.mount("/files", StaticFiles(directory="uploads"), name="files")
-
 jobs = {}
 
 LANG_MAP = {
@@ -52,18 +51,41 @@ def parse_clips(result):
         })
     return clips
 
+async def upload_to_cloudinary(fpath: Path, ext: str) -> str:
+    """Upload file to Cloudinary and return public URL"""
+    import hashlib, time, hmac
+    timestamp = str(int(time.time()))
+    signature_str = f"timestamp={timestamp}{CLOUDINARY_SECRET}"
+    signature = hashlib.sha1(signature_str.encode()).hexdigest()
+    
+    with open(fpath, "rb") as f:
+        file_data = f.read()
+    
+    async with httpx.AsyncClient(timeout=300) as client:
+        res = await client.post(
+            f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/video/upload",
+            data={
+                "api_key": CLOUDINARY_KEY,
+                "timestamp": timestamp,
+                "signature": signature,
+                "resource_type": "video",
+            },
+            files={"file": (f"video.{ext}", file_data, f"video/{ext}")}
+        )
+    
+    data = res.json()
+    print(f"Cloudinary upload: {res.status_code} | {str(data)[:300]}")
+    return data.get("secure_url", "")
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "engine": "vizard"}
+    return {"status": "ok", "engine": "vizard", "cloudinary": bool(CLOUDINARY_CLOUD)}
 
 @app.get("/project/{project_id}")
 async def get_project(project_id: str):
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            res = await client.get(
-                VIZARD_QUERY.format(project_id),
-                headers={"VIZARDAI_API_KEY": VIZARD_API_KEY}
-            )
+            res = await client.get(VIZARD_QUERY.format(project_id), headers={"VIZARDAI_API_KEY": VIZARD_API_KEY})
         result = res.json()
         code = result.get("code")
         if code == 2000:
@@ -91,96 +113,79 @@ async def upload(
         shutil.copyfileobj(file.file, f)
 
     print(f"Saved: {fname} ({fpath.stat().st_size} bytes)")
-
-    # Verify file is accessible before sending to Vizard
-    video_url = f"{BASE_URL}/files/{fname}"
     lang = LANG_MAP.get(subtitle_language, "en")
-
-    asyncio.create_task(process_vizard(job_id, video_url, ext, lang, fpath))
+    asyncio.create_task(process_vizard(job_id, fpath, ext, lang))
     return {"job_id": job_id}
 
-async def process_vizard(job_id: str, video_url: str, ext: str, lang: str, fpath: Path):
+async def process_vizard(job_id: str, fpath: Path, ext: str, lang: str):
     try:
-        jobs[job_id] = {"status": "transcribing", "progress": 20}
+        jobs[job_id] = {"status": "transcribing", "progress": 25}
 
-        # First verify our file URL is accessible
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                check = await client.head(video_url)
-            print(f"File URL check: {check.status_code} for {video_url}")
-            if check.status_code != 200:
-                jobs[job_id] = {"status": "failed", "error": f"File not accessible: HTTP {check.status_code}"}
-                return
-        except Exception as e:
-            print(f"File URL check failed: {e}")
-            # Continue anyway - Railway might block HEAD but allow GET
+        # Upload to Cloudinary for a reliable public URL
+        print(f"Uploading to Cloudinary...")
+        video_url = await upload_to_cloudinary(fpath, ext)
+        
+        if not video_url:
+            jobs[job_id] = {"status": "failed", "error": "Failed to upload to Cloudinary"}
+            return
+
+        print(f"Cloudinary URL: {video_url}")
+        jobs[job_id] = {"status": "scoring", "progress": 40}
 
         headers = {"Content-Type": "application/json", "VIZARDAI_API_KEY": VIZARD_API_KEY}
-
-        # Use correct parameter format per Vizard docs
         payload = {
             "videoUrl": video_url,
-            "videoType": 1,          # 1 = direct file URL
+            "videoType": 1,
             "ext": ext,
             "lang": lang,
-            "preferLength": "[1,2]", # MUST be string per docs
-            "ratioOfClip": 1,        # 9:16 vertical
+            "preferLength": "[1,2]",
+            "ratioOfClip": 1,
             "subtitleSwitch": 1,
             "headlineSwitch": 1,
             "maxClipNumber": 10,
         }
 
-        print(f"Vizard create payload: {payload}")
-
+        print(f"Calling Vizard: {video_url}")
         async with httpx.AsyncClient(timeout=120) as client:
             res = await client.post(VIZARD_CREATE, headers=headers, json=payload)
 
-        print(f"Vizard create: {res.status_code} | {res.text[:400]}")
+        print(f"Vizard: {res.status_code} | {res.text[:300]}")
 
         if res.status_code != 200:
-            jobs[job_id] = {"status": "failed", "error": f"HTTP {res.status_code}: {res.text[:200]}"}
+            jobs[job_id] = {"status": "failed", "error": f"HTTP {res.status_code}"}
             return
 
         data = res.json()
-        code = data.get("code")
-
-        if code != 2000:
-            err = data.get("errMsg") or data.get("message") or str(data)
-            print(f"Vizard create error: code={code} err={err}")
-            jobs[job_id] = {"status": "failed", "error": f"Vizard code {code}: {err}"}
+        if data.get("code") != 2000:
+            err = data.get("errMsg") or str(data)
+            jobs[job_id] = {"status": "failed", "error": f"Code {data.get('code')}: {err}"}
             return
 
         project_id = str(data.get("projectId"))
-        print(f"Vizard project_id: {project_id}")
-        jobs[job_id] = {"status": "scoring", "progress": 40, "project_id": project_id}
+        print(f"Project ID: {project_id}")
+        jobs[job_id] = {"status": "cutting", "progress": 50, "project_id": project_id}
 
-        # Poll up to 20 minutes
         for attempt in range(200):
             await asyncio.sleep(6)
             try:
                 async with httpx.AsyncClient(timeout=30) as client:
-                    poll = await client.get(
-                        VIZARD_QUERY.format(project_id),
-                        headers={"VIZARDAI_API_KEY": VIZARD_API_KEY}
-                    )
+                    poll = await client.get(VIZARD_QUERY.format(project_id), headers={"VIZARDAI_API_KEY": VIZARD_API_KEY})
                 result = poll.json()
                 code = result.get("code")
                 print(f"Poll {attempt}: code={code}")
 
                 if code == 2000:
                     clips = parse_clips(result)
-                    print(f"Success! {len(clips)} clips")
+                    print(f"Done! {len(clips)} clips")
                     jobs[job_id] = {"status": "done", "progress": 100, "clips": clips}
                     return
                 elif code == 2001:
-                    progress = min(40 + attempt // 2, 92)
-                    jobs[job_id] = {"status": "cutting", "progress": progress, "project_id": project_id}
+                    jobs[job_id] = {"status": "cutting", "progress": min(50 + attempt // 2, 92), "project_id": project_id}
                 else:
-                    err = result.get("errMsg") or str(result)[:200]
-                    jobs[job_id] = {"status": "failed", "error": f"Code {code}: {err}", "project_id": project_id}
+                    jobs[job_id] = {"status": "failed", "error": f"Code {code}", "project_id": project_id}
                     return
             except Exception as e:
-                print(f"Poll {attempt} error: {e}")
+                print(f"Poll error: {e}")
                 continue
 
         jobs[job_id] = {"status": "failed", "error": "Timed out", "project_id": project_id}
