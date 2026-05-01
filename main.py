@@ -58,7 +58,6 @@ def health():
 
 @app.get("/project/{project_id}")
 async def get_project(project_id: str):
-    """Fetch clips directly from Vizard project ID"""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             res = await client.get(
@@ -68,10 +67,9 @@ async def get_project(project_id: str):
         result = res.json()
         code = result.get("code")
         if code == 2000:
-            clips = parse_clips(result)
-            return {"status": "done", "progress": 100, "clips": clips}
+            return {"status": "done", "progress": 100, "clips": parse_clips(result)}
         elif code == 2001:
-            return {"status": "cutting", "progress": 50, "clips": []}
+            return {"status": "cutting", "progress": 60, "clips": []}
         else:
             return {"status": "failed", "error": str(result), "clips": []}
     except Exception as e:
@@ -88,45 +86,75 @@ async def upload(
 
     ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else "mp4"
     fname = f"{job_id}.{ext}"
-    with open(UPLOAD_DIR / fname, "wb") as f:
+    fpath = UPLOAD_DIR / fname
+    with open(fpath, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    print(f"Saved: {fname}")
+    print(f"Saved: {fname} ({fpath.stat().st_size} bytes)")
+
+    # Verify file is accessible before sending to Vizard
     video_url = f"{BASE_URL}/files/{fname}"
     lang = LANG_MAP.get(subtitle_language, "en")
-    asyncio.create_task(process_vizard(job_id, video_url, ext, lang))
+
+    asyncio.create_task(process_vizard(job_id, video_url, ext, lang, fpath))
     return {"job_id": job_id}
 
-async def process_vizard(job_id: str, video_url: str, ext: str, lang: str):
+async def process_vizard(job_id: str, video_url: str, ext: str, lang: str, fpath: Path):
     try:
-        jobs[job_id] = {"status": "transcribing", "progress": 25}
+        jobs[job_id] = {"status": "transcribing", "progress": 20}
+
+        # First verify our file URL is accessible
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                check = await client.head(video_url)
+            print(f"File URL check: {check.status_code} for {video_url}")
+            if check.status_code != 200:
+                jobs[job_id] = {"status": "failed", "error": f"File not accessible: HTTP {check.status_code}"}
+                return
+        except Exception as e:
+            print(f"File URL check failed: {e}")
+            # Continue anyway - Railway might block HEAD but allow GET
+
         headers = {"Content-Type": "application/json", "VIZARDAI_API_KEY": VIZARD_API_KEY}
+
+        # Use correct parameter format per Vizard docs
         payload = {
-            "videoUrl": video_url, "videoType": 1, "ext": ext, "lang": lang,
-            "preferLength": [1, 2], "ratioOfClip": 1,
-            "subtitleSwitch": 1, "headlineSwitch": 1, "maxClipNumber": 10,
+            "videoUrl": video_url,
+            "videoType": 1,          # 1 = direct file URL
+            "ext": ext,
+            "lang": lang,
+            "preferLength": "[1,2]", # MUST be string per docs
+            "ratioOfClip": 1,        # 9:16 vertical
+            "subtitleSwitch": 1,
+            "headlineSwitch": 1,
+            "maxClipNumber": 10,
         }
+
+        print(f"Vizard create payload: {payload}")
 
         async with httpx.AsyncClient(timeout=120) as client:
             res = await client.post(VIZARD_CREATE, headers=headers, json=payload)
 
-        print(f"Create: {res.status_code} | {res.text[:300]}")
+        print(f"Vizard create: {res.status_code} | {res.text[:400]}")
 
         if res.status_code != 200:
-            jobs[job_id] = {"status": "failed", "error": f"HTTP {res.status_code}"}
+            jobs[job_id] = {"status": "failed", "error": f"HTTP {res.status_code}: {res.text[:200]}"}
             return
 
         data = res.json()
-        if data.get("code") != 2000:
-            jobs[job_id] = {"status": "failed", "error": f"Code {data.get('code')}: {data.get('errMsg', '')}"}
+        code = data.get("code")
+
+        if code != 2000:
+            err = data.get("errMsg") or data.get("message") or str(data)
+            print(f"Vizard create error: code={code} err={err}")
+            jobs[job_id] = {"status": "failed", "error": f"Vizard code {code}: {err}"}
             return
 
-        project_id = data.get("projectId")
-        print(f"Project ID: {project_id}")
-        # Store project_id so frontend can use it as fallback
+        project_id = str(data.get("projectId"))
+        print(f"Vizard project_id: {project_id}")
         jobs[job_id] = {"status": "scoring", "progress": 40, "project_id": project_id}
 
-        # Poll up to 20 minutes (200 attempts x 6 seconds)
+        # Poll up to 20 minutes
         for attempt in range(200):
             await asyncio.sleep(6)
             try:
@@ -141,17 +169,18 @@ async def process_vizard(job_id: str, video_url: str, ext: str, lang: str):
 
                 if code == 2000:
                     clips = parse_clips(result)
-                    print(f"Done! {len(clips)} clips")
+                    print(f"Success! {len(clips)} clips")
                     jobs[job_id] = {"status": "done", "progress": 100, "clips": clips}
                     return
                 elif code == 2001:
                     progress = min(40 + attempt // 2, 92)
                     jobs[job_id] = {"status": "cutting", "progress": progress, "project_id": project_id}
                 else:
-                    jobs[job_id] = {"status": "failed", "error": f"Code {code}: {result.get('errMsg', '')}"}
+                    err = result.get("errMsg") or str(result)[:200]
+                    jobs[job_id] = {"status": "failed", "error": f"Code {code}: {err}", "project_id": project_id}
                     return
             except Exception as e:
-                print(f"Poll error: {e}")
+                print(f"Poll {attempt} error: {e}")
                 continue
 
         jobs[job_id] = {"status": "failed", "error": "Timed out", "project_id": project_id}
